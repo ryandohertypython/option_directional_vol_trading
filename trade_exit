@@ -250,431 +250,435 @@ stock_contract = Stock(symbol = ticker,
 
 stock_contract_qual = ib.qualifyContracts(stock_contract)[0]
 
-ib.connect('127.0.0.1', 7497, clientId = client_id) 
+while True:
 
-'''
-active trades
-'''
+    clear_output(wait = True)
 
-'''
-retrieve live market data for underlying instrument
-'''
-current_price = ib.reqMktData(contract = stock_contract_qual).last
-ib.sleep(2)
+    ib.connect('127.0.0.1', 7497, clientId = client_id) 
 
-'''
-convert active trades file into dataframe and format
-'''
-active_trades = pd.read_csv(active_trades_file, header = None)
-active_trades.columns = ['long_call_contract', 'short_call_contract', 'long_put_contract', 'short_put_contract', 'combo_contract', 
-                         'lmt_price', 'trade_size', 'commission', 'price', 'trad_days_exp_@_ent', 'trad_days_ext_@_ent', 'exe_time_us_@_ent']
-
-# convert contract strings into contract objects
-active_trades['long_call_contract'] = [str_to_option_func(option_str) for option_str in active_trades['long_call_contract']] 
-active_trades['short_call_contract'] = [str_to_option_func(option_str) for option_str in active_trades['short_call_contract']] 
-active_trades['long_put_contract'] = [str_to_option_func(option_str) for option_str in active_trades['long_put_contract']] 
-active_trades['short_put_contract'] = [str_to_option_func(option_str) for option_str in active_trades['short_put_contract']] 
-active_trades['combo_contract'] = [string_to_combo_func(combo_str) for combo_str in active_trades['combo_contract']] 
-
-# retrieve and format expiration dates, current number of trading days, exit days, trade completion ratios and exit day booleans
-active_trades['exp_date'] = [contract.lastTradeDateOrContractMonth for contract in active_trades['long_call_contract']]
-active_trades['exp_date'] = [dt.datetime.strptime(exp_date, '%Y%m%d').date() for exp_date in active_trades['exp_date']]
-active_trades['num_trad_days_exp'] = [num_trad_days_exp_func(exp_date) for exp_date in active_trades['exp_date']]
-active_trades['exit_day'] = active_trades['trad_days_exp_@_ent'] - active_trades['trad_days_ext_@_ent']
-active_trades['num_trad_days_ext'] = active_trades['num_trad_days_exp'] - active_trades['exit_day']
-active_trades['trade_completion'] = (1 - (active_trades['num_trad_days_ext'] / active_trades['trad_days_ext_@_ent'])) * 100
-
-# retrieve strikes, multipliers, premiums, costs, breakevens and upper / lower max profit to cost scenarios
-active_trades['long_call_strike'] = [contract.strike for contract in active_trades['long_call_contract']]
-active_trades['short_call_strike'] = [contract.strike for contract in active_trades['short_call_contract']]
-active_trades['long_put_strike'] = [contract.strike for contract in active_trades['long_put_contract']]
-active_trades['short_put_strike'] = [contract.strike for contract in active_trades['short_put_contract']]
-active_trades['multiplier'] = [float(contract.multiplier) for contract in active_trades['long_call_contract']]
-active_trades['premium'] = active_trades['lmt_price'] * active_trades['multiplier']
-active_trades['total_premium'] = active_trades['premium'] * active_trades['trade_size']
-active_trades['cost'] = -(active_trades['price']) * active_trades['multiplier']
-active_trades['total_cost'] = active_trades['cost'] * active_trades['trade_size']
-active_trades['bes_upper'] = active_trades['long_call_strike'] + (abs(active_trades['cost']) / active_trades['multiplier'])
-active_trades['bes_lower'] = active_trades['long_put_strike'] - (abs(active_trades['cost']) / active_trades['multiplier'])
-active_trades['bes_upper_pct'] = ((active_trades['bes_upper'] / current_price) - 1) * 100 
-active_trades['bes_lower_pct'] = ((active_trades['bes_lower'] / current_price) - 1) * 100
-active_trades['π_cost_sc'] = ((active_trades['short_call_strike'] - active_trades['long_call_strike']) / (abs(active_trades['cost']) / active_trades['multiplier']) - 1) * 100
-active_trades['π_cost_sp'] = ((active_trades['long_put_strike'] - active_trades['short_put_strike']) / (abs(active_trades['cost']) / active_trades['multiplier']) - 1) * 100
-
-'''
-retrieve live market data for options
-'''
-active_trades_combo_contract_bids = []
-
-for combo_contract in active_trades['combo_contract']:
+    '''
+    active trades
+    '''
     
-    combo_data = ib.reqMktData(contract = combo_contract)
-    ib.sleep(0.5)
-    combo_price = combo_data.bid
-    active_trades_combo_contract_bids.append(combo_price)
-
-active_trades['combo_bid'] = active_trades_combo_contract_bids
-
-# compute profit and loss
-active_trades['value']  = active_trades['combo_bid'] * active_trades['multiplier']
-active_trades['total_value'] = active_trades['value'] * active_trades['trade_size']
-active_trades['π'] = active_trades['value'] - abs(active_trades['cost'])
-active_trades['total_π'] = active_trades['π'] * active_trades['trade_size'] 
-active_trades['π_cost'] = (active_trades['total_π'] / abs(active_trades['total_cost'])) * 100
-
-'''
-retrieve exit strategies
-'''
-active_trades_exit_strat_bools = []
-
-for trade_completion, π_cost in list(zip(active_trades['trade_completion'], active_trades['π_cost'])): 
-
-    active_trades_exit_strat_bool = exit_strat_func(trade_completion, π_cost)
-    active_trades_exit_strat_bools.append(active_trades_exit_strat_bool)
+    '''
+    retrieve live market data for underlying instrument
+    '''
+    current_price = ib.reqMktData(contract = stock_contract_qual).last
+    ib.sleep(2)
     
-active_trades['exit_strat_bool'] = active_trades_exit_strat_bools 
-
-# sort by profit to cost
-active_trades = active_trades.sort_values(by = ['π_cost'] , ascending = [False])
-
-'''
-retrieve total active trade pnls
-'''
-active_trades_total = pd.DataFrame({'total_π': pd.Series(active_trades['total_π'].sum()),
-                                    'total_cost': pd.Series(active_trades['total_cost'].sum()),
-                                    'π_cost': pd.Series((active_trades['total_π'].sum() / abs(active_trades['total_cost'].sum()))) * 100
-                                   })
-
-'''
-print results
-'''
-print('* active trades table *')
-print('')
-print(tb.tabulate(active_trades[active_trades_table_columns].round(2),
-                  headers = active_trades_table_columns,
-                  showindex = False))
-print('')
-print('* active trades total table *')
-print('')
-print(tb.tabulate(active_trades_total.round(2),
-                  headers = active_trades_total.columns,
-                  showindex = False))
-
-'''
-exit trades
-'''
-
-'''
-filter active trades for exits accordingly:
-    (1) outside exit strategy parameters
-    (2) trading day exit has been reached
-'''
-exit_trades = active_trades[(active_trades['exit_strat_bool'] == True) | (active_trades['num_trad_days_exp'] < active_trades['exit_day'])].sort_values(by = 'π_cost', ascending = True)
-
-'''
-print results
-'''
-if len(exit_trades) > 0:
+    '''
+    convert active trades file into dataframe and format
+    '''
+    active_trades = pd.read_csv(active_trades_file, header = None)
+    active_trades.columns = ['long_call_contract', 'short_call_contract', 'long_put_contract', 'short_put_contract', 'combo_contract', 
+                             'lmt_price', 'trade_size', 'commission', 'price', 'trad_days_exp_@_ent', 'trad_days_ext_@_ent', 'exe_time_us_@_ent']
     
+    # convert contract strings into contract objects
+    active_trades['long_call_contract'] = [str_to_option_func(option_str) for option_str in active_trades['long_call_contract']] 
+    active_trades['short_call_contract'] = [str_to_option_func(option_str) for option_str in active_trades['short_call_contract']] 
+    active_trades['long_put_contract'] = [str_to_option_func(option_str) for option_str in active_trades['long_put_contract']] 
+    active_trades['short_put_contract'] = [str_to_option_func(option_str) for option_str in active_trades['short_put_contract']] 
+    active_trades['combo_contract'] = [string_to_combo_func(combo_str) for combo_str in active_trades['combo_contract']] 
+    
+    # retrieve and format expiration dates, current number of trading days, exit days, trade completion ratios and exit day booleans
+    active_trades['exp_date'] = [contract.lastTradeDateOrContractMonth for contract in active_trades['long_call_contract']]
+    active_trades['exp_date'] = [dt.datetime.strptime(exp_date, '%Y%m%d').date() for exp_date in active_trades['exp_date']]
+    active_trades['num_trad_days_exp'] = [num_trad_days_exp_func(exp_date) for exp_date in active_trades['exp_date']]
+    active_trades['exit_day'] = active_trades['trad_days_exp_@_ent'] - active_trades['trad_days_ext_@_ent']
+    active_trades['num_trad_days_ext'] = active_trades['num_trad_days_exp'] - active_trades['exit_day']
+    active_trades['trade_completion'] = (1 - (active_trades['num_trad_days_ext'] / active_trades['trad_days_ext_@_ent'])) * 100
+    
+    # retrieve strikes, multipliers, premiums, costs, breakevens and upper / lower max profit to cost scenarios
+    active_trades['long_call_strike'] = [contract.strike for contract in active_trades['long_call_contract']]
+    active_trades['short_call_strike'] = [contract.strike for contract in active_trades['short_call_contract']]
+    active_trades['long_put_strike'] = [contract.strike for contract in active_trades['long_put_contract']]
+    active_trades['short_put_strike'] = [contract.strike for contract in active_trades['short_put_contract']]
+    active_trades['multiplier'] = [float(contract.multiplier) for contract in active_trades['long_call_contract']]
+    active_trades['premium'] = active_trades['lmt_price'] * active_trades['multiplier']
+    active_trades['total_premium'] = active_trades['premium'] * active_trades['trade_size']
+    active_trades['cost'] = -(active_trades['price']) * active_trades['multiplier']
+    active_trades['total_cost'] = active_trades['cost'] * active_trades['trade_size']
+    active_trades['bes_upper'] = active_trades['long_call_strike'] + (abs(active_trades['cost']) / active_trades['multiplier'])
+    active_trades['bes_lower'] = active_trades['long_put_strike'] - (abs(active_trades['cost']) / active_trades['multiplier'])
+    active_trades['bes_upper_pct'] = ((active_trades['bes_upper'] / current_price) - 1) * 100 
+    active_trades['bes_lower_pct'] = ((active_trades['bes_lower'] / current_price) - 1) * 100
+    active_trades['π_cost_sc'] = ((active_trades['short_call_strike'] - active_trades['long_call_strike']) / (abs(active_trades['cost']) / active_trades['multiplier']) - 1) * 100
+    active_trades['π_cost_sp'] = ((active_trades['long_put_strike'] - active_trades['short_put_strike']) / (abs(active_trades['cost']) / active_trades['multiplier']) - 1) * 100
+    
+    '''
+    retrieve live market data for options
+    '''
+    active_trades_combo_contract_bids = []
+    
+    for combo_contract in active_trades['combo_contract']:
+        
+        combo_data = ib.reqMktData(contract = combo_contract)
+        ib.sleep(0.5)
+        combo_price = combo_data.bid
+        active_trades_combo_contract_bids.append(combo_price)
+    
+    active_trades['combo_bid'] = active_trades_combo_contract_bids
+    
+    # compute profit and loss
+    active_trades['value']  = active_trades['combo_bid'] * active_trades['multiplier']
+    active_trades['total_value'] = active_trades['value'] * active_trades['trade_size']
+    active_trades['π'] = active_trades['value'] - abs(active_trades['cost'])
+    active_trades['total_π'] = active_trades['π'] * active_trades['trade_size'] 
+    active_trades['π_cost'] = (active_trades['total_π'] / abs(active_trades['total_cost'])) * 100
+    
+    '''
+    retrieve exit strategies
+    '''
+    active_trades_exit_strat_bools = []
+    
+    for trade_completion, π_cost in list(zip(active_trades['trade_completion'], active_trades['π_cost'])): 
+    
+        active_trades_exit_strat_bool = exit_strat_func(trade_completion, π_cost)
+        active_trades_exit_strat_bools.append(active_trades_exit_strat_bool)
+        
+    active_trades['exit_strat_bool'] = active_trades_exit_strat_bools 
+    
+    # sort by profit to cost
+    active_trades = active_trades.sort_values(by = ['π_cost'] , ascending = [False])
+    
+    '''
+    retrieve total active trade pnls
+    '''
+    active_trades_total = pd.DataFrame({'total_π': pd.Series(active_trades['total_π'].sum()),
+                                        'total_cost': pd.Series(active_trades['total_cost'].sum()),
+                                        'π_cost': pd.Series((active_trades['total_π'].sum() / abs(active_trades['total_cost'].sum()))) * 100
+                                       })
+    
+    '''
+    print results
+    '''
+    print('* active trades table *')
     print('')
-    print('* trade exits table *')
-    print('')
-    print(tb.tabulate(exit_trades[active_trades_table_columns].round(2),
+    print(tb.tabulate(active_trades[active_trades_table_columns].round(2),
                       headers = active_trades_table_columns,
                       showindex = False))
     print('')
-
-'''
-define conditions for trade exits
-'''
-print('* trade updates *')
-
-'''
-condition a:
-    check for nan values from interactive brokers api requests
-'''
-if (np.isnan(current_price) or
-    np.isnan(exit_trades['combo_bid']).any() or
-    (exit_trades['combo_bid'] == 0).any()):
+    print('* active trades total table *')
+    print('')
+    print(tb.tabulate(active_trades_total.round(2),
+                      headers = active_trades_total.columns,
+                      showindex = False))
     
-    cond_a_bool = False
-    cond_a_status = 'nan values present...'
-else:
-    cond_a_bool = True
-    cond_a_status = 'api requests loaded...'
-
-'''
-condition b:
-    check for any open orders from script client id
-'''
-if cond_a_bool:
+    '''
+    exit trades
+    '''
     
-    if open_orders_func():
-        
-        cond_b_bool = False
-        cond_b_status = 'active open orders...'
-    else:
-        cond_b_bool = True
-        cond_b_status = 'no open orders...'
-        
-else:
-    cond_b_bool = False
-    cond_b_status = cond_a_status
+    '''
+    filter active trades for exits accordingly:
+        (1) outside exit strategy parameters
+        (2) trading day exit has been reached
+    '''
+    exit_trades = active_trades[(active_trades['exit_strat_bool'] == True) | (active_trades['num_trad_days_exp'] < active_trades['exit_day'])].sort_values(by = 'π_cost', ascending = True)
     
-'''
-condition c:
-    check whether there are potential trade exits
-'''
-if cond_b_bool:
-    
+    '''
+    print results
+    '''
     if len(exit_trades) > 0:
         
-        cond_c_bool = True
-        cond_c_status = 'potential trades available...'
+        print('')
+        print('* trade exits table *')
+        print('')
+        print(tb.tabulate(exit_trades[active_trades_table_columns].round(2),
+                          headers = active_trades_table_columns,
+                          showindex = False))
+        print('')
+    
+    '''
+    define conditions for trade exits
+    '''
+    print('* trade updates *')
+    
+    '''
+    condition a:
+        check for nan values from interactive brokers api requests
+    '''
+    if (np.isnan(current_price) or
+        np.isnan(exit_trades['combo_bid']).any() or
+        (exit_trades['combo_bid'] == 0).any()):
         
+        cond_a_bool = False
+        cond_a_status = 'nan values present...'
+    else:
+        cond_a_bool = True
+        cond_a_status = 'api requests loaded...'
+    
+    '''
+    condition b:
+        check for any open orders from script client id
+    '''
+    if cond_a_bool:
+        
+        if open_orders_func():
+            
+            cond_b_bool = False
+            cond_b_status = 'active open orders...'
+        else:
+            cond_b_bool = True
+            cond_b_status = 'no open orders...'
+            
+    else:
+        cond_b_bool = False
+        cond_b_status = cond_a_status
+        
+    '''
+    condition c:
+        check whether there are potential trade exits
+    '''
+    if cond_b_bool:
+        
+        if len(exit_trades) > 0:
+            
+            cond_c_bool = True
+            cond_c_status = 'potential trades available...'
+            
+        else:
+            cond_c_bool = False
+            cond_c_status = 'no potential trades...'
+            
     else:
         cond_c_bool = False
-        cond_c_status = 'no potential trades...'
+        cond_c_status = cond_b_status
         
-else:
-    cond_c_bool = False
-    cond_c_status = cond_b_status
-    
-'''
-print results
-'''
-print('')
-print(cond_c_status)
-print('')
-
-'''
-trade exits
-'''
-if cond_c_bool:
-    
-    # set up trade exit and order
-    long_call_option_contract = exit_trades['long_call_contract'].iloc[0]
-    short_call_option_contract = exit_trades['short_call_contract'].iloc[0]
-    long_put_option_contract = exit_trades['long_put_contract'].iloc[0]
-    short_put_option_contract = exit_trades['short_put_contract'].iloc[0]
-    
-    combo_legs = [
-        ComboLeg(conId = long_call_option_contract.conId, ratio = 1, action = 'BUY', exchange = exchange),
-        ComboLeg(conId = short_call_option_contract.conId, ratio = 1, action = 'SELL', exchange = exchange),
-        ComboLeg(conId = long_put_option_contract.conId, ratio = 1, action = 'BUY', exchange = exchange),
-        ComboLeg(conId = short_put_option_contract.conId, ratio = 1, action = 'SELL', exchange = exchange)
-    ]
-    
-    combo_option_contract = Contract(symbol = ticker, 
-                                     secType = 'BAG', 
-                                     exchange = exchange, 
-                                     currency = currency, 
-                                     comboLegs = combo_legs)
-    
-    lmt_price = exit_trades['combo_bid'].iloc[0]
-    trade_size = exit_trades['trade_size'].iloc[0]
-    
-    order_type = LimitOrder(action = 'SELL',
-                            totalQuantity = trade_size,
-                            lmtPrice = lmt_price,
-                            allOrNone = False)
-    
-    order_exit = ib.placeOrder(contract = combo_option_contract,
-                                order = order_type)
-    
-    print('order placed...')
+    '''
+    print results
+    '''
+    print('')
+    print(cond_c_status)
     print('')
     
-    ib.sleep(60)
+    '''
+    trade exits
+    '''
+    if cond_c_bool:
+        
+        # set up trade exit and order
+        long_call_option_contract = exit_trades['long_call_contract'].iloc[0]
+        short_call_option_contract = exit_trades['short_call_contract'].iloc[0]
+        long_put_option_contract = exit_trades['long_put_contract'].iloc[0]
+        short_put_option_contract = exit_trades['short_put_contract'].iloc[0]
+        
+        combo_legs = [
+            ComboLeg(conId = long_call_option_contract.conId, ratio = 1, action = 'BUY', exchange = exchange),
+            ComboLeg(conId = short_call_option_contract.conId, ratio = 1, action = 'SELL', exchange = exchange),
+            ComboLeg(conId = long_put_option_contract.conId, ratio = 1, action = 'BUY', exchange = exchange),
+            ComboLeg(conId = short_put_option_contract.conId, ratio = 1, action = 'SELL', exchange = exchange)
+        ]
+        
+        combo_option_contract = Contract(symbol = ticker, 
+                                         secType = 'BAG', 
+                                         exchange = exchange, 
+                                         currency = currency, 
+                                         comboLegs = combo_legs)
+        
+        lmt_price = exit_trades['combo_bid'].iloc[0]
+        trade_size = exit_trades['trade_size'].iloc[0]
+        
+        order_type = LimitOrder(action = 'SELL',
+                                totalQuantity = trade_size,
+                                lmtPrice = lmt_price,
+                                allOrNone = False)
+        
+        order_exit = ib.placeOrder(contract = combo_option_contract,
+                                    order = order_type)
+        
+        print('order placed...')
+        print('')
+        
+        ib.sleep(60)
+        
+        '''
+        cancel order if it cannot be fully filled within given timeframe
+        '''
+        if open_orders_func():
+            
+            ib.cancelOrder(order = order_exit.order)
+            ib.sleep(5)
+            
+            '''
+            request ib.fills() to check whether trades were filled
+            '''
+            # refresh ib.fills()
+            ib.disconnect()
+            ib.connect('127.0.0.1', 7497, clientId = client_id) 
     
-    '''
-    cancel order if it cannot be fully filled within given timeframe
-    '''
-    if open_orders_func():
+            fills = ib.fills()
+            ib.sleep(5)
+    
+            recent_fills = [fill for fill in fills if recent_trade_func(fill)]
+            
+            if recent_fills:
+    
+                order_bool = True
+                order_status = 'order partially filled...'
+                print(order_status)
+    
+            else:
+                order_bool = False
+                order_status = 'order cancelled...'
+                print(order_status)
         
-        ib.cancelOrder(order = order_exit.order)
-        ib.sleep(5)
-        
-        '''
-        request ib.fills() to check whether trades were filled
-        '''
-        # refresh ib.fills()
-        ib.disconnect()
-        ib.connect('127.0.0.1', 7497, clientId = client_id) 
-
-        fills = ib.fills()
-        ib.sleep(5)
-
-        recent_fills = [fill for fill in fills if recent_trade_func(fill)]
-        
-        if recent_fills:
-
+        else:
             order_bool = True
-            order_status = 'order partially filled...'
+            order_status = 'order completed...'  
             print(order_status)
-
-        else:
-            order_bool = False
-            order_status = 'order cancelled...'
-            print(order_status)
+            
+        if order_bool:
+            
+            '''
+            request ib.fills() to retrieve actual trade entry execution parameters
+            '''
+            # refresh ib.fills()
+            ib.disconnect()
+            ib.connect('127.0.0.1', 7497, clientId = client_id) 
     
-    else:
-        order_bool = True
-        order_status = 'order completed...'  
-        print(order_status)
-        
-    if order_bool:
-        
-        '''
-        request ib.fills() to retrieve actual trade entry execution parameters
-        '''
-        # refresh ib.fills()
-        ib.disconnect()
-        ib.connect('127.0.0.1', 7497, clientId = client_id) 
-
-        fills = ib.fills()
-        ib.sleep(5)
-
-        combo_fills = [fill for fill in fills if fill.contract.secType == 'BAG' and fill.execution.side == 'SLD' and recent_trade_func(fill)]
-        option_fills = [fill for fill in fills if fill.contract.secType == 'OPT'and fill.execution.clientId == client_id and recent_trade_func(fill)]
-
-        lmt_price  = sum(np.array([fill.execution.price for fill in combo_fills]) * np.array([fill.execution.shares for fill in combo_fills])) / sum(np.array([fill.execution.shares for fill in combo_fills]))
-        trade_fill = sum([fill.execution.shares for fill in combo_fills])
-        commission = sum([fill.commissionReport.commission for fill in option_fills])
-        price = lmt_price - (commission / (trade_size * exit_trades['multiplier'].iloc[0])) # - commissions for price sold
-        
-        exe_time_us_at_ext = dt.datetime.now(pytz.utc).replace(tzinfo = pytz.utc).astimezone(pytz.timezone('US/Eastern'))
-                    
-        if trade_size != trade_fill:
+            fills = ib.fills()
+            ib.sleep(5)
+    
+            combo_fills = [fill for fill in fills if fill.contract.secType == 'BAG' and fill.execution.side == 'SLD' and recent_trade_func(fill)]
+            option_fills = [fill for fill in fills if fill.contract.secType == 'OPT'and fill.execution.clientId == client_id and recent_trade_func(fill)]
+    
+            lmt_price  = sum(np.array([fill.execution.price for fill in combo_fills]) * np.array([fill.execution.shares for fill in combo_fills])) / sum(np.array([fill.execution.shares for fill in combo_fills]))
+            trade_fill = sum([fill.execution.shares for fill in combo_fills])
+            commission = sum([fill.commissionReport.commission for fill in option_fills])
+            price = lmt_price - (commission / (trade_size * exit_trades['multiplier'].iloc[0])) # - commissions for price sold
             
-            '''
-            update active trades with new remaining trade size after partial fill
-            '''
-            active_trades.at[active_trades[active_trades['exe_time_us_@_ent'] == exit_trades['exe_time_us_@_ent'].iloc[0]].index[0], 'trade_size'] = trade_size - trade_fill
-            
-            '''
-            append new partial trade exit details to completed trades
-            '''
-            new_trade_exit_dets = pd.DataFrame({'long_call_strike': exit_trades['long_call_strike'].iloc[0],
-                                                'short_call_strike': exit_trades['short_call_strike'].iloc[0],
-                                                'long_put_strike': exit_trades['long_put_strike'].iloc[0],
-                                                'short_put_strike': exit_trades['short_put_strike'].iloc[0],
-                                                'exe_time_us_@_ent': exit_trades['exe_time_us_@_ent'].iloc[0],
-                                                'lmt_price_ent': exit_trades['lmt_price'].iloc[0],
-                                                'commission_ent': exit_trades['commission'].iloc[0],
-                                                'price_ent': exit_trades['price'].iloc[0],
-                                                'trad_days_exp_@_ent': exit_trades['trad_days_exp_@_ent'].iloc[0], 
-                                                'trad_days_ext_@_ent':exit_trades['trad_days_ext_@_ent'].iloc[0],
-                                                'exp_date': exit_trades['exp_date'].iloc[0], 
-                                                'exit_day':exit_trades['exit_day'].iloc[0], 
-                                                'trad_days_exp_@_ext': exit_trades['trad_days_exp_@_ent'].iloc[0],
-                                                'trad_days_ext_@_ext':exit_trades['trad_days_exp_@_ent'].iloc[0],
-                                                'mutliplier': exit_trades['multiplier'].iloc[0],
-                                                'premium': exit_trades['premium'].iloc[0],
-                                                'total_premium': exit_trades['total_premium'].iloc[0],
-                                                'cost': exit_trades['cost'].iloc[0],
-                                                'total_cost': exit_trades['total_cost'].iloc[0],
-                                                'bes_upper': exit_trades['bes_upper'].iloc[0],
-                                                'bes_lower': exit_trades['bes_lower'].iloc[0],
-                                                'bes_upper_pct': exit_trades['bes_upper_pct'].iloc[0],
-                                                'bes_lower_pct': exit_trades['bes_lower_pct'].iloc[0],
-                                                'π_cost_sc': exit_trades['π_cost_sc'].iloc[0], 
-                                                'π_cost_sp': exit_trades['π_cost_sp'].iloc[0],
-                                                'exit_strat_bool': exit_trades['exit_strat_bool'].iloc[0],
-                                                'exe_time_us_@_ext': [exe_time_us_at_ext],
-                                                'lmt_price_ext': [lmt_price],
-                                                'trade_size': [trade_fill],
-                                                'commission_ext': [commission],
-                                                'price_ext': [price]
-                                               })
+            exe_time_us_at_ext = dt.datetime.now(pytz.utc).replace(tzinfo = pytz.utc).astimezone(pytz.timezone('US/Eastern'))
+                        
+            if trade_size != trade_fill:
                 
-            with open(completed_trades_file, 'a', newline = '') as file:
-                writer = csv.writer(file)
-                writer.writerow(new_trade_exit_dets.iloc[0].values)
-
-            '''
-            update active trades file in existing format
-            '''
-            active_trades_update = active_trades_update = pd.DataFrame({'long_call_contract': [str(option) for option in active_trades['long_call_contract']],
-                                                                        'short_call_contract': [str(option) for option in active_trades['short_call_contract']],
-                                                                        'long_put_contract': [str(option) for option in active_trades['long_put_contract']],
-                                                                        'short_put_contract': [str(option) for option in active_trades['short_put_contract']],
-                                                                        'combo_contract': [str(combo) for combo in active_trades['combo_contract']],
-                                                                        'lmt_price': active_trades['lmt_price'], 
-                                                                        'trade_size':active_trades['trade_size'],
-                                                                        'commission': active_trades['commission'],
-                                                                        'trad_days_exp_@_ent': active_trades['trad_days_exp_@_ent'], 
-                                                                        'trad_days_ext_@_ent': active_trades['trad_days_ext_@_ent'],
-                                                                        'exe_time_us_@_ent': active_trade['exe_time_us_@_ent']
-                                                                       })
-
-            active_trades_update.to_csv(active_trades_file, index = False, header = False)     
-            
+                '''
+                update active trades with new remaining trade size after partial fill
+                '''
+                active_trades.at[active_trades[active_trades['exe_time_us_@_ent'] == exit_trades['exe_time_us_@_ent'].iloc[0]].index[0], 'trade_size'] = trade_size - trade_fill
+                
+                '''
+                append new partial trade exit details to completed trades
+                '''
+                new_trade_exit_dets = pd.DataFrame({'long_call_strike': exit_trades['long_call_strike'].iloc[0],
+                                                    'short_call_strike': exit_trades['short_call_strike'].iloc[0],
+                                                    'long_put_strike': exit_trades['long_put_strike'].iloc[0],
+                                                    'short_put_strike': exit_trades['short_put_strike'].iloc[0],
+                                                    'exe_time_us_@_ent': exit_trades['exe_time_us_@_ent'].iloc[0],
+                                                    'lmt_price_ent': exit_trades['lmt_price'].iloc[0],
+                                                    'commission_ent': exit_trades['commission'].iloc[0],
+                                                    'price_ent': exit_trades['price'].iloc[0],
+                                                    'trad_days_exp_@_ent': exit_trades['trad_days_exp_@_ent'].iloc[0], 
+                                                    'trad_days_ext_@_ent':exit_trades['trad_days_ext_@_ent'].iloc[0],
+                                                    'exp_date': exit_trades['exp_date'].iloc[0], 
+                                                    'exit_day':exit_trades['exit_day'].iloc[0], 
+                                                    'trad_days_exp_@_ext': exit_trades['trad_days_exp_@_ent'].iloc[0],
+                                                    'trad_days_ext_@_ext':exit_trades['trad_days_exp_@_ent'].iloc[0],
+                                                    'mutliplier': exit_trades['multiplier'].iloc[0],
+                                                    'premium': exit_trades['premium'].iloc[0],
+                                                    'total_premium': exit_trades['total_premium'].iloc[0],
+                                                    'cost': exit_trades['cost'].iloc[0],
+                                                    'total_cost': exit_trades['total_cost'].iloc[0],
+                                                    'bes_upper': exit_trades['bes_upper'].iloc[0],
+                                                    'bes_lower': exit_trades['bes_lower'].iloc[0],
+                                                    'bes_upper_pct': exit_trades['bes_upper_pct'].iloc[0],
+                                                    'bes_lower_pct': exit_trades['bes_lower_pct'].iloc[0],
+                                                    'π_cost_sc': exit_trades['π_cost_sc'].iloc[0], 
+                                                    'π_cost_sp': exit_trades['π_cost_sp'].iloc[0],
+                                                    'exit_strat_bool': exit_trades['exit_strat_bool'].iloc[0],
+                                                    'exe_time_us_@_ext': [exe_time_us_at_ext],
+                                                    'lmt_price_ext': [lmt_price],
+                                                    'trade_size': [trade_fill],
+                                                    'commission_ext': [commission],
+                                                    'price_ext': [price]
+                                                   })
+                    
+                with open(completed_trades_file, 'a', newline = '') as file:
+                    writer = csv.writer(file)
+                    writer.writerow(new_trade_exit_dets.iloc[0].values)
+    
+                '''
+                update active trades file in existing format
+                '''
+                active_trades_update = active_trades_update = pd.DataFrame({'long_call_contract': [str(option) for option in active_trades['long_call_contract']],
+                                                                            'short_call_contract': [str(option) for option in active_trades['short_call_contract']],
+                                                                            'long_put_contract': [str(option) for option in active_trades['long_put_contract']],
+                                                                            'short_put_contract': [str(option) for option in active_trades['short_put_contract']],
+                                                                            'combo_contract': [str(combo) for combo in active_trades['combo_contract']],
+                                                                            'lmt_price': active_trades['lmt_price'], 
+                                                                            'trade_size':active_trades['trade_size'],
+                                                                            'commission': active_trades['commission'],
+                                                                            'trad_days_exp_@_ent': active_trades['trad_days_exp_@_ent'], 
+                                                                            'trad_days_ext_@_ent': active_trades['trad_days_ext_@_ent'],
+                                                                            'exe_time_us_@_ent': active_trade['exe_time_us_@_ent']
+                                                                           })
+    
+                active_trades_update.to_csv(active_trades_file, index = False, header = False)     
+                
+            else:
+                '''
+                append new filled trade exit details to completed trades
+                '''
+                new_trade_exit_dets = pd.DataFrame({'long_call_strike': exit_trades['long_call_strike'].iloc[0],
+                                                    'short_call_strike': exit_trades['short_call_strike'].iloc[0],
+                                                    'long_put_strike': exit_trades['long_put_strike'].iloc[0],
+                                                    'short_put_strike': exit_trades['short_put_strike'].iloc[0],
+                                                    'exe_time_us_@_ent': exit_trades['exe_time_us_@_ent'].iloc[0],
+                                                    'lmt_price_ent': exit_trades['lmt_price'].iloc[0],
+                                                    'commission_ent': exit_trades['commission'].iloc[0],
+                                                    'price_ent': exit_trades['price'].iloc[0],
+                                                    'trad_days_exp_@_ent': exit_trades['trad_days_exp_@_ent'].iloc[0], 
+                                                    'trad_days_ext_@_ent':exit_trades['trad_days_ext_@_ent'].iloc[0],
+                                                    'exp_date': exit_trades['exp_date'].iloc[0], 
+                                                    'exit_day':exit_trades['exit_day'].iloc[0], 
+                                                    'trad_days_exp_@_ext': exit_trades['trad_days_exp_@_ent'].iloc[0],
+                                                    'trad_days_ext_@_ext': exit_trades['trad_days_exp_@_ent'].iloc[0],
+                                                    'multiplier': exit_trades['multiplier'].iloc[0],
+                                                    'premium': exit_trades['premium'].iloc[0],
+                                                    'total_premium': exit_trades['total_premium'].iloc[0],
+                                                    'cost': exit_trades['cost'].iloc[0],
+                                                    'total_cost': exit_trades['total_cost'].iloc[0],
+                                                    'bes_upper': exit_trades['bes_upper'].iloc[0],
+                                                    'bes_lower': exit_trades['bes_lower'].iloc[0],
+                                                    'bes_upper_pct': exit_trades['bes_upper_pct'].iloc[0],
+                                                    'bes_lower_pct': exit_trades['bes_lower_pct'].iloc[0],
+                                                    'π_cost_sc': exit_trades['π_cost_sc'].iloc[0], 
+                                                    'π_cost_sp': exit_trades['π_cost_sp'].iloc[0],
+                                                    'exit_strat_bool': exit_trades['exit_strat_bool'].iloc[0],
+                                                    'exe_time_us_@_ext': [exe_time_us_at_ext],
+                                                    'lmt_price_ext': [lmt_price],
+                                                    'trade_size': [trade_fill],
+                                                    'commission_ext': [commission],
+                                                    'price_ext': [price]
+                                                   })
+    
+                with open(completed_trades_file, 'a', newline = '') as file:
+                    writer = csv.writer(file)
+                    writer.writerow(new_trade_exit_dets.iloc[0].values)
+    
+                '''
+                update active trades dataframe by dropping trade exit
+                '''
+                active_trades = active_trades.drop(active_trades[active_trades['exe_time_us_@_ent'] == exit_trades['exe_time_us_@_ent'].iloc[0]].index[0])
+    
+                active_trades_update = pd.DataFrame({'long_call_contract': [str(option) for option in active_trades['long_call_contract']],
+                                                     'short_call_contract': [str(option) for option in active_trades['short_call_contract']],
+                                                     'long_put_contract': [str(option) for option in active_trades['long_put_contract']],
+                                                     'short_put_contract': [str(option) for option in active_trades['short_put_contract']],
+                                                     'combo_contract': [str(combo) for combo in active_trades['combo_contract']],
+                                                     'lmt_price': active_trades['lmt_price'], 
+                                                     'trade_size':active_trades['trade_size'],
+                                                     'commission': active_trades['commission'],
+                                                     'trad_days_exp_@_ent': active_trades['trad_days_exp_@_ent'], 
+                                                     'trad_days_ext_@_ent': active_trades['trad_days_ext_@_ent'],
+                                                     'exe_time_us_@_ent': active_trade['exe_time_us_@_ent']
+                                                    })
+    
+                active_trades_update.to_csv(active_trades_file, index = False, header = False)
+                
         else:
-            '''
-            append new filled trade exit details to completed trades
-            '''
-            new_trade_exit_dets = pd.DataFrame({'long_call_strike': exit_trades['long_call_strike'].iloc[0],
-                                                'short_call_strike': exit_trades['short_call_strike'].iloc[0],
-                                                'long_put_strike': exit_trades['long_put_strike'].iloc[0],
-                                                'short_put_strike': exit_trades['short_put_strike'].iloc[0],
-                                                'exe_time_us_@_ent': exit_trades['exe_time_us_@_ent'].iloc[0],
-                                                'lmt_price_ent': exit_trades['lmt_price'].iloc[0],
-                                                'commission_ent': exit_trades['commission'].iloc[0],
-                                                'price_ent': exit_trades['price'].iloc[0],
-                                                'trad_days_exp_@_ent': exit_trades['trad_days_exp_@_ent'].iloc[0], 
-                                                'trad_days_ext_@_ent':exit_trades['trad_days_ext_@_ent'].iloc[0],
-                                                'exp_date': exit_trades['exp_date'].iloc[0], 
-                                                'exit_day':exit_trades['exit_day'].iloc[0], 
-                                                'trad_days_exp_@_ext': exit_trades['trad_days_exp_@_ent'].iloc[0],
-                                                'trad_days_ext_@_ext': exit_trades['trad_days_exp_@_ent'].iloc[0],
-                                                'multiplier': exit_trades['multiplier'].iloc[0],
-                                                'premium': exit_trades['premium'].iloc[0],
-                                                'total_premium': exit_trades['total_premium'].iloc[0],
-                                                'cost': exit_trades['cost'].iloc[0],
-                                                'total_cost': exit_trades['total_cost'].iloc[0],
-                                                'bes_upper': exit_trades['bes_upper'].iloc[0],
-                                                'bes_lower': exit_trades['bes_lower'].iloc[0],
-                                                'bes_upper_pct': exit_trades['bes_upper_pct'].iloc[0],
-                                                'bes_lower_pct': exit_trades['bes_lower_pct'].iloc[0],
-                                                'π_cost_sc': exit_trades['π_cost_sc'].iloc[0], 
-                                                'π_cost_sp': exit_trades['π_cost_sp'].iloc[0],
-                                                'exit_strat_bool': exit_trades['exit_strat_bool'].iloc[0],
-                                                'exe_time_us_@_ext': [exe_time_us_at_ext],
-                                                'lmt_price_ext': [lmt_price],
-                                                'trade_size': [trade_fill],
-                                                'commission_ext': [commission],
-                                                'price_ext': [price]
-                                               })
-
-            with open(completed_trades_file, 'a', newline = '') as file:
-                writer = csv.writer(file)
-                writer.writerow(new_trade_exit_dets.iloc[0].values)
-
-            '''
-            update active trades dataframe by dropping trade exit
-            '''
-            active_trades = active_trades.drop(active_trades[active_trades['exe_time_us_@_ent'] == exit_trades['exe_time_us_@_ent'].iloc[0]].index[0])
-
-            active_trades_update = pd.DataFrame({'long_call_contract': [str(option) for option in active_trades['long_call_contract']],
-                                                 'short_call_contract': [str(option) for option in active_trades['short_call_contract']],
-                                                 'long_put_contract': [str(option) for option in active_trades['long_put_contract']],
-                                                 'short_put_contract': [str(option) for option in active_trades['short_put_contract']],
-                                                 'combo_contract': [str(combo) for combo in active_trades['combo_contract']],
-                                                 'lmt_price': active_trades['lmt_price'], 
-                                                 'trade_size':active_trades['trade_size'],
-                                                 'commission': active_trades['commission'],
-                                                 'trad_days_exp_@_ent': active_trades['trad_days_exp_@_ent'], 
-                                                 'trad_days_ext_@_ent': active_trades['trad_days_ext_@_ent'],
-                                                 'exe_time_us_@_ent': active_trade['exe_time_us_@_ent']
-                                                })
-
-            active_trades_update.to_csv(active_trades_file, index = False, header = False)
-            
+            ib.sleep(5)
+            ib.disconnect()
     else:
-        ib.sleep(5)
+        print('no order was placed...')
+        ib.sleep(60)
         ib.disconnect()
-else:
-    print('no order was placed...')
-    ib.sleep(60)
-    ib.disconnect()
