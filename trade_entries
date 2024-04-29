@@ -1,0 +1,1222 @@
+''' Import Packages '''
+from ib_insync import *
+import pandas as pd
+import datetime as dt
+import numpy as np
+import pytz
+import zoneinfo
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
+from ipywidgets import interact, FloatSlider
+import scipy as sci
+from IPython.display import clear_output
+from IPython.display import display
+import itertools as iter
+import csv
+import tabulate as tb
+import re
+import dateutil as du
+import time as t
+import os
+import sys
+import contextlib as cont
+
+''' Manual Definitions '''
+# Interactive Brokers client interface
+client_id = 1
+ib = IB()
+
+# Underlying Instrument Parameters
+ticker = 'SPY'
+exchange = 'SMART'
+currency = 'USD'
+
+# Historical Market Data Parameters
+hist_start_date = ''
+hist_end_date = ''
+hist_dur = '55 Y'
+hist_bar_size = '1 day'
+
+# Files
+hol_dates_file = r'C:\Users\x\Documents\Python\trades\holiday_dates.txt'
+port_val_file = r'C:\Users\x\Documents\Python\trades\portfolio_value.txt'
+min_prob_π_pct_file = r'C:\x\Ryan Doherty\Documents\Python\trades\minimum_probability_profit.txt'
+lat_price_file = r'C:\Users\x\Documents\Python\trades\latest_price.txt'
+active_trades_file = r'C:\Users\x\Documents\Python\trades\active_trades.txt'
+
+# Maximum Number of Trading Days till Expiration for Tradeable Options
+max_num_trad_dates = 64
+
+# Number of Trading Dates before Trade Exit
+num_trad_exit_dates = 1
+
+# Percentage of Rolling Periods that are used to create Simulation
+pers_pct_def = 1
+
+# Number of Simulations for Monte Carlo Simulation
+trials = 10000
+
+# Percentage Change Boundary for Tradeabble Options
+strike_pct_bnd = 10
+
+# Maximum Percentage given to a single Trade Entry relative to Portfolio Value
+trade_size_pct = 1
+
+# Minimum and Maximum Premiums per Contract
+min_prem_per_contract = 2
+max_prem_per_contract = 10
+
+# Mimimum and Maximum Profit to Premium Percentages of Call and Put Spreads
+min_π_prem_pct = 25
+max_π_prem_pct = 1000
+
+# Defined 'Maximum', Minimum Probability of Profit for Tradeable Options
+min_prob_π_pct_def = 75
+
+# Minimum Expected Profit for Tradeable Options 
+min_exp_π_prems_pct = 10
+
+# Percentage Change Hurdle for New Trade Entries
+trade_entry_pct_hurd = 0.5
+
+''' Connect to Interactive Brokers TWS API ''' 
+def api_connect_func(client_id):
+    ib.connect('127.0.0.1', 7497, clientId = client_id)
+    
+''' Retrieve the Number of Trading Dates till Expiration '''
+def num_trad_dates_exp_func(exp_date):
+    
+    today_date = dt.datetime.now().date()
+    exp_date = dt.datetime.strptime(exp_date, '%Y%m%d').date()
+    
+    hol_dates = []
+    
+    with open(hol_dates_file, mode = 'r', newline = '') as file:
+        reader = csv.reader(file)
+        for row in reader:
+            hol_dates.append(tuple(row))
+    
+    full_hol_dates = [date[0] for date in hol_dates if date[1] == 'full']
+    full_hol_dates = [dt.datetime.strptime(date, '%Y%m%d').date() for date in full_hol_dates]
+    
+    trad_dates = np.busday_count(begindates = today_date, 
+                                 enddates = exp_date, 
+                                 holidays = full_hol_dates)
+    trad_dates += 1
+    
+    return trad_dates
+
+''' Separate Continous Similar Price Period into Uniquee Continuous Price Periods '''
+def cont_price_pers_func(pct_cont):
+
+    pct_cont_pers = []
+    pct_cont_per = pd.Series()
+    prev_i = None
+
+    for i, pct in pct_cont.items():
+        if prev_i == None or i == (prev_i + 1):
+            pct_cont_per.at[i] = pct
+        else:
+            pct_cont_pers.append(pct_cont_per)
+            pct_cont_per = pd.Series([pct], index = [i])
+        prev_i = i
+        
+    if not pct_cont_per.empty:
+        pct_cont_pers.append(pct_cont_per)
+    
+    pct_cont_pers = pd.Series(pct_cont_pers)
+    pct_cont_pers = [pct_cont_per.reset_index(drop = True) for pct_cont_per in pct_cont_pers]
+    
+    mult_cont_pers = [(pct_cont_per / 100) + 1 for pct_cont_per in pct_cont_pers]
+    mult_cont_pers = [pd.concat([pd.Series([0]), mult_cont_per]).reset_index(drop = True) 
+                      for mult_cont_per in mult_cont_pers]
+    
+    for mult_cont_per in mult_cont_pers:
+        mult_cont_per[0] = 1
+        
+    cum_pct_cont_pers = []
+    cum_mult_cont_pers = []
+    
+    for mult_cont_per  in mult_cont_pers:
+        cum_mult_cont_per = mult_cont_per.reset_index(drop = True)
+        
+        for i in range(1, len(mult_cont_per)):
+            cum_mult_cont_per[i] = cum_mult_cont_per[i - 1] * mult_cont_per[i]
+        cum_mult_cont_pers.append(cum_mult_cont_per)
+        
+        cum_pct_cont_per = (cum_mult_cont_per - 1) * 100
+        cum_pct_cont_pers.append(cum_pct_cont_per)
+        
+    return cum_pct_cont_pers
+
+''' Qualify Options Contracts while Handling Error Outputs '''
+def qualify_options_contracts_func(options):
+    
+    @cont.contextmanager
+    def error_handler_func():
+        ''' Handle Error Outputs '''
+
+        new_error = open(os.devnull, 'w')
+        old_error = sys.stderr
+        sys.stderr = new_error
+        try:
+            yield
+        finally:
+            sys.stderr = old_error
+            new_error.close()
+    
+    options_qual = []
+    
+    with error_handler_func():
+        
+        for call, put in options:
+            
+            call = ib.qualifyContracts(call)
+            ib.sleep(0.2)
+            
+            put = ib.qualifyContracts(put)
+            ib.sleep(0.2)
+            
+            if call and put:
+                options_qual.append((call[0], put[0]))
+                
+    return options_qual
+
+''' Find the Live Number of Trading Days till Expiration '''
+def live_num_trad_days_exp_func(exp_date):
+    
+    today_date = dt.datetime.now().date()
+    exp_date = dt.datetime.strptime(exp_date, '%Y%m%d').date()
+    
+    hol_dates = []
+    
+    with open(hol_dates_file, mode = 'r', newline = '') as file:
+        reader = csv.reader(file)
+        for row in reader:
+            hol_dates.append(tuple(row))
+    
+    full_hol_dates = [date[0] for date in hol_dates if date[1] == 'full']
+    full_hol_dates = [dt.datetime.strptime(date, '%Y%m%d').date() for date in full_hol_dates]
+    half_hol_dates = [date[0] for date in hol_dates if date[1] == 'half']
+    half_hol_dates = [dt.datetime.strptime(date, '%Y%m%d').date() for date in half_hol_dates] 
+    
+    trad_days = np.busday_count(begindates = today_date, 
+                                enddates = exp_date, 
+                                holidays = full_hol_dates)
+    trad_days += 1
+    
+    for half_hol_date in half_hol_dates:
+        if today_date <= half_hol_date <= exp_date:
+            trad_days -= 13/27 # (14/27) is the fraction of a normal trading day lost to half holidays
+    
+    if np.is_busday(today_date, holidays = full_hol_dates):
+        
+        live_time_usa = dt.datetime.now(zoneinfo.ZoneInfo('US/Eastern'))
+        live_time_usa = (live_time_usa.hour * 3600 
+                         + live_time_usa.minute * 60 
+                         + live_time_usa.second)
+
+        mkt_open_time_usa = dt.time(hour = 9, minute = 30)
+        mkt_open_time_usa = (mkt_open_time_usa.hour * 3600 
+                             + mkt_open_time_usa.minute * 60 
+                             + mkt_open_time_usa.second)
+
+        mkt_close_time_usa = dt.time(hour = 16, minute = 15)
+        mkt_close_time_usa = (mkt_close_time_usa.hour * 3600 
+                              + mkt_close_time_usa.minute * 60 
+                              + mkt_close_time_usa.second)
+
+        mkt_dur = mkt_close_time_usa - mkt_open_time_usa
+
+        if today_date in half_hol_dates:
+
+            mkt_close_time_usa = dt.time(hour = 13, minute = 0)
+            mkt_close_time_usa = (mkt_close_time_usa.hour * 3600 
+                                  + mkt_close_time_usa.minute * 60 
+                                  + mkt_close_time_usa.second)
+
+            mkt_dur = mkt_close_time_usa - mkt_open_time_usa
+
+            if mkt_open_time_usa <= live_time_usa <= mkt_close_time_usa:
+                trad_day_frac = ((live_time_usa - mkt_open_time_usa) / mkt_dur) 
+            else:
+                trad_day_frac = 0
+        else:
+            if mkt_open_time_usa <= live_time_usa <= mkt_close_time_usa:
+                trad_day_frac = (live_time_usa - mkt_open_time_usa) / mkt_dur
+            else:
+                trad_day_frac = 0
+    else:
+        trad_day_frac = 0
+
+    trad_days -= trad_day_frac
+    
+    return trad_days
+
+''' Find Index Values at which Half Market Holidays occur within given Expiration Date '''
+def half_hol_date_ind_func(exp_date):
+    
+    today_date = dt.datetime.now().date()
+    exp_date = dt.datetime.strptime(exp_date, '%Y%m%d').date()
+
+    hol_dates = []
+
+    with open(hol_dates_file, mode = 'r', newline = '') as file:
+        reader = csv.reader(file)
+        for row in reader:
+            hol_dates.append(tuple(row))
+
+    full_hol_dates = [date[0] for date in hol_dates if date[1] == 'full']
+    full_hol_dates = [dt.datetime.strptime(date, '%Y%m%d').date() for date in full_hol_dates]
+    half_hol_dates = [date[0] for date in hol_dates if date[1] == 'half']
+    half_hol_dates = [dt.datetime.strptime(date, '%Y%m%d').date() for date in half_hol_dates] 
+
+    trad_days = np.busday_count(begindates = today_date, enddates = exp_date)
+    trad_days += 1 # Include expiration day as a trading day
+
+    trad_dates = pd.Series(np.busday_offset(today_date, np.arange(trad_days), holidays = full_hol_dates, roll = 'forward'))
+    trad_dates = trad_dates[: - num_trad_exit_dates]
+
+    half_hol_dates_ind = trad_dates[trad_dates.isin(half_hol_dates)].index.values
+    
+    return half_hol_dates_ind
+
+''' Calculate how much of the Current Trading Day has past as a Fraction '''
+def live_trad_day_frac_func():
+    
+    today_date = dt.datetime.now().date()
+    
+    hol_dates = []
+    
+    with open(hol_dates_file, mode = 'r', newline = '') as file:
+        reader = csv.reader(file)
+        for row in reader:
+            hol_dates.append(tuple(row))
+    
+    full_hol_dates = [date[0] for date in hol_dates if date[1] == 'full']
+    full_hol_dates = [dt.datetime.strptime(date, '%Y%m%d').date() for date in full_hol_dates]
+    
+    half_hol_dates = [date[0] for date in hol_dates if date[1] == 'half']
+    half_hol_dates = [dt.datetime.strptime(date, '%Y%m%d').date() for date in half_hol_dates]
+    
+    if np.is_busday(today_date, holidays = full_hol_dates):
+    
+        live_time_usa = dt.datetime.now(zoneinfo.ZoneInfo('US/Eastern'))
+        live_time_usa = (live_time_usa.hour * 3600 
+                         + live_time_usa.minute * 60 
+                         + live_time_usa.second)
+
+        mkt_open_time_usa = dt.time(hour = 9, minute = 30)
+        mkt_open_time_usa = (mkt_open_time_usa.hour * 3600 
+                             + mkt_open_time_usa.minute * 60 
+                             + mkt_open_time_usa.second)
+
+        mkt_close_time_usa = dt.time(hour = 16, minute = 15)
+        mkt_close_time_usa = (mkt_close_time_usa.hour * 3600 
+                              + mkt_close_time_usa.minute * 60 
+                              + mkt_close_time_usa.second)
+
+        mkt_dur = mkt_close_time_usa - mkt_open_time_usa
+        
+        if today_date in half_hol_dates:
+
+            mkt_close_time_usa = dt.time(hour = 13, minute = 0)
+            mkt_close_time_usa = (mkt_close_time_usa.hour * 3600 
+                                  + mkt_close_time_usa.minute * 60 
+                                  + mkt_close_time_usa.second)
+
+            mkt_dur = mkt_close_time_usa - mkt_open_time_usa
+
+            if mkt_open_time_usa <= live_time_usa <= mkt_close_time_usa:
+                # (14/27) is the fraction of a normal trading day given to half holidays
+                trad_day_frac = ((live_time_usa - mkt_open_time_usa) / mkt_dur) * 14/27
+            else:
+                trad_day_frac = 0
+        else:
+            if mkt_open_time_usa <= live_time_usa <= mkt_close_time_usa:
+                trad_day_frac = (live_time_usa - mkt_open_time_usa) / mkt_dur
+            else:
+                trad_day_frac = 0
+    else:
+        trad_day_frac = 0
+    
+    return trad_day_frac
+
+''' Check whether this Session's Fills occurred within the Loop for Trade Entries '''
+def recent_fill_check_func(fill):
+    
+    live_time_utc = dt.datetime.now(pytz.utc) # UTC is used in accordance with ib.fills() datetimes
+    fill_time_utc = fill.execution.time
+    time_dif = live_time_utc - fill_time_utc
+    
+    if abs(time_dif) <= dt.timedelta(seconds = 90):
+        return True
+    else:
+        return False
+
+''' Connect to Interactive Brokers TWS API '''
+# Applies to Jupyter Notebooks
+util.startLoop()
+
+api_connect_func(client_id)
+
+''' Create Stock Contract '''
+stock_contract = Stock(symbol = ticker,
+                       exchange = exchange,
+                       currency = currency)
+
+stock_contract = ib.qualifyContracts(stock_contract)[0]
+ib.sleep(1)
+
+''' Historical Market Data '''
+hist_mkt_data = ib.reqHistoricalData(contract = stock_contract,
+                                     endDateTime = hist_end_date,
+                                     durationStr = hist_dur,
+                                     barSizeSetting = hist_bar_size,
+                                     whatToShow = 'TRADES',
+                                     formatDate = 1,
+                                     useRTH = True)
+
+hist_mkt_data = pd.DataFrame(hist_mkt_data)
+hist_prices = hist_mkt_data['close']
+hist_dates = hist_mkt_data['date']
+
+''' Options Data '''
+options_data = ib.reqSecDefOptParams(underlyingSymbol = stock_contract.symbol, 
+                                        futFopExchange = '', 
+                                        underlyingSecType = stock_contract.secType,
+                                        underlyingConId = stock_contract.conId)
+    
+options_data = pd.DataFrame(options_data)
+
+''' Expiration and Number of Trading Dates '''
+exp_dates = options_data[options_data['exchange'] == exchange]['expirations'].iloc[0]
+num_trad_dates = [num_trad_dates_exp_func(exp_date) for exp_date in exp_dates]
+
+num_trad_exp_dates = pd.DataFrame({'num_trad_dates': num_trad_dates,
+                                   'exp_dates': exp_dates})
+
+num_trad_dates_def = num_trad_exp_dates[num_trad_exp_dates['num_trad_dates'] <= max_num_trad_dates].iloc[-1]
+num_trad_dates_exp_def = num_trad_dates_def['num_trad_dates']
+num_trad_dates_ext_def = num_trad_dates_exp_def - num_trad_exit_dates  
+
+''' Forward and Backward Trading Dates '''
+num_fwd_trad_dates = max_num_trad_dates - num_trad_exit_dates
+num_bck_trad_dates = num_fwd_trad_dates 
+
+''' Forward and Backward Historical Rolling Periods '''
+# (1) Prices 
+# (2) Dates
+# (3) Percentage Changes
+# (4) Multipliers
+# (5) Cumulative Multipliers
+# (6) Cumulative Percentage Changes
+
+fwd_price_pers = []
+fwd_date_pers = []
+fwd_pct_pers = []
+fwd_cum_pct_pers = []
+fwd_mult_pers = []
+fwd_cum_mult_pers = []
+
+for i in range(len(hist_prices) - num_fwd_trad_dates - num_bck_trad_dates):
+    
+    fwd_price_per = hist_prices[i + (num_bck_trad_dates): i + (num_bck_trad_dates + num_fwd_trad_dates + 1)]
+    fwd_date_per = hist_dates[i + (num_bck_trad_dates): i + (num_bck_trad_dates + num_fwd_trad_dates + 1)]
+    fwd_pct_per = fwd_price_per.pct_change() * 100
+    fwd_mult_per = fwd_price_per.pct_change() + 1
+    fwd_mult_per[i + (num_bck_trad_dates)] = 1
+    fwd_mult_per_indres = fwd_mult_per.reset_index(drop = True)
+    fwd_cum_mult_per = fwd_mult_per_indres 
+    
+    for i in range(1, len(fwd_cum_mult_per)):
+        fwd_cum_mult_per[i] = fwd_cum_mult_per[i - 1] * fwd_mult_per_indres[i]
+
+    fwd_cum_pct_per = (fwd_cum_mult_per - 1) * 100
+    
+    fwd_price_pers.append(fwd_price_per)
+    fwd_date_pers.append(fwd_date_per)
+    fwd_pct_pers.append(fwd_pct_per)
+    fwd_mult_pers.append(fwd_mult_per)
+    fwd_cum_mult_pers.append(fwd_cum_mult_per)
+    fwd_cum_pct_pers.append(fwd_cum_pct_per)
+    
+bck_price_pers = []
+bck_date_pers = []
+bck_pct_pers = []
+bck_cum_pct_pers = []
+bck_mult_pers = []
+bck_cum_mult_pers = []
+
+for i in range(len(hist_prices) - num_fwd_trad_dates - num_bck_trad_dates):
+    
+    bck_price_per = hist_prices[i: i + (num_bck_trad_dates + 1)]
+    bck_date_per = hist_dates[i: i + (num_bck_trad_dates + 1)]
+    bck_pct_per = bck_price_per.pct_change() * 100
+    bck_mult_per = bck_price_per.pct_change() + 1
+    bck_mult_per[i] = 1
+    bck_mult_per_indres = bck_mult_per.reset_index(drop = True)
+    bck_cum_mult_per = bck_mult_per_indres 
+    
+    for i in range(1, len(bck_cum_mult_per)):
+        bck_cum_mult_per[i] = bck_cum_mult_per[i - 1] * bck_mult_per_indres[i]
+
+    bck_cum_pct_per = (bck_cum_mult_per - 1) * 100
+    
+    bck_price_pers.append(bck_price_per)
+    bck_date_pers.append(bck_date_per)
+    bck_pct_pers.append(bck_pct_per)
+    bck_mult_pers.append(bck_mult_per)
+    bck_cum_mult_pers.append(bck_cum_mult_per)
+    bck_cum_pct_pers.append(bck_cum_pct_per)
+
+''' Latest Rolling Period '''
+lat_price_per = hist_prices[- num_bck_trad_dates - 1:]
+lat_date_per = hist_dates[ - num_bck_trad_dates - 1:]
+lat_pct_per = lat_price_per.pct_change() * 100
+lat_mult_per = lat_price_per.pct_change() + 1
+lat_mult_per[lat_price_per.index[0]] = 1
+lat_mult_per_indres = lat_mult_per.reset_index(drop = True)
+lat_cum_mult_per = lat_mult_per_indres
+
+for i in range(1, len(lat_cum_mult_per)):
+    lat_cum_mult_per[i] = lat_cum_mult_per[i - 1] * lat_mult_per_indres[i]
+
+lat_cum_pct_per = (lat_cum_mult_per - 1) * 100
+
+''' Euclidean Distances '''
+euclid_dists = []
+
+for per in bck_cum_mult_pers:
+    euclid_dist = sum((abs((np.array(lat_cum_mult_per) - np.array(per))) + 1) ** 2)
+    euclid_dists.append(euclid_dist)
+
+''' Periods Dataframe '''
+pers = pd.DataFrame({'bck_price_pers': bck_price_pers,
+                     'fwd_price_pers': fwd_price_pers,
+                     'bck_date_pers': bck_date_pers,
+                     'fwd_date_pers': fwd_date_pers,
+                     'bck_pct_pers': bck_pct_pers,
+                     'fwd_pct_pers': fwd_pct_pers,
+                     'bck_mult_pers': bck_mult_pers,
+                     'fwd_mult_pers': fwd_mult_pers,
+                     'bck_cum_mult_pers': bck_cum_mult_pers,
+                     'fwd_cum_mult_pers': fwd_cum_mult_pers,
+                     'bck_cum_pct_pers': bck_cum_pct_pers,
+                     'fwd_cum_pct_pers': fwd_cum_pct_pers,
+                     'euclid_dists': euclid_dists})
+
+pers = pers.sort_values(by = 'euclid_dists', ascending = True)
+pers = pers[: int(len(pers) * (pers_pct_def / 100))]
+
+''' Continuous Forward and Backward Historical Rolling Periods for Percentage Changes '''
+fwd_pct_cont_per = pd.concat(pers['fwd_pct_pers'].to_list()).dropna().sort_index()
+fwd_pct_cont_per = fwd_pct_cont_per[~fwd_pct_cont_per.index.duplicated(keep = 'first')]
+
+bck_pct_cont_per = pd.concat(pers['bck_pct_pers'].to_list()).dropna().sort_index()
+bck_pct_cont_per = bck_pct_cont_per[~bck_pct_cont_per.index.duplicated(keep = 'first')]
+
+if True:
+
+    ''' Plot Historical Price Period with Similar Price Periods alongside Latest Price Period '''
+    plt.figure(figsize = (30, 10))
+
+    plt.plot(hist_dates, hist_prices, color = 'dodgerblue', linewidth = 0.75)
+
+    for bck_date_per, bck_price_per in pers[['bck_date_pers','bck_price_pers']].values:
+        plt.plot(bck_date_per, bck_price_per, color = 'black', linewidth = 1.5) 
+
+    for fwd_date_per, fwd_price_per in pers[['fwd_date_pers', 'fwd_price_pers']].values:
+        plt.plot(fwd_date_per, fwd_price_per, color = 'darkorchid', linewidth = 1.5)
+
+    plt.plot(lat_date_per, lat_price_per, color = 'red', linewidth = 1)
+
+    plt.grid(True, which = 'both', linewidth = 0.25, color = 'grey')
+    plt.rc('axes', axisbelow = True)
+    plt.title('Similar Price Periods to Latest Price Period')
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+    plt.legend(handles = [mlines.Line2D([], [], color = 'dodgerblue', label = 'Historical Prices'),
+                          mlines.Line2D([], [], color = 'black', label = 'Backward Price Periods'),
+                          mlines.Line2D([], [], color = 'darkorchid', label = 'Forward Price Periods'),
+                          mlines.Line2D([], [], color = 'red', label = 'Latest Price Period')],
+               loc = 'upper left')
+
+    plt.show()
+
+    ''' Plot Similar Backward Price Periods with Latest Price Period ''' 
+    plt.figure(figsize = (30, 10))
+
+    for per in pers['bck_cum_pct_pers'].values:
+        plt.plot(per, color = 'tomato', linewidth = 0.75, linestyle = '--')
+
+    plt.plot(lat_cum_pct_per, color = 'black', linewidth = 1.5)
+
+    plt.grid(True, which = 'both', linewidth = 0.25, color = 'grey')
+    plt.rc('axes', axisbelow = True)
+    plt.axhline(y = 0, color = 'black', linewidth = 1)
+    plt.title('Similar Backward Price Periods to Latest Price Period')
+    plt.xlabel('Number of Trading Trading Dates')
+    plt.ylabel('Percentage Change')
+    plt.legend(handles = [mlines.Line2D([], [], color = 'tomato', label = 'Backward Cumulative Percentage Periods'),
+                          mlines.Line2D([], [], color = 'black', label = 'Latest Cumulative Percentage Period')],
+               loc = 'upper left')
+
+    plt.show()      
+
+    ''' Plot Forward Price Periods based on Similar Backward Price Periods with Latest Price Period ''' 
+    plt.figure(figsize = (30, 10))
+
+    for per in pers['fwd_cum_pct_pers'].values:
+        plt.plot(per, color = 'dodgerblue', linewidth = 0.75, linestyle = '--')
+
+    plt.grid(True, which = 'both', linewidth = 0.25, color = 'grey')
+    plt.rc('axes', axisbelow = True)
+    plt.axhline(y = 0, color = 'black', linewidth = 1)
+    plt.title('Forward Price Periods (based on Similar Backward Price Periods) to Latest Price Period')
+    plt.xlabel('Number of Trading Dates')
+    plt.ylabel('Percentage Change')
+    plt.legend(handles = [mlines.Line2D([], [], color = 'dodgerblue', label = 'Forward Cumulative Percentage Change Periods')],
+               loc = 'upper left')
+
+    plt.show()     
+
+    ''' Plot Forward and Backward Similar Price Periods to Latest Price Period '''
+    plt.figure(figsize = (30, 10))
+
+    for per in pers['bck_cum_pct_pers'].values:
+        plt.plot(per, color = 'tomato', linewidth = 0.75, linestyle = '--')
+
+    for per in pers['fwd_cum_pct_pers'].values:
+        plt.plot(per, color = 'dodgerblue', linewidth = 0.75, linestyle = '--')
+
+    plt.plot(lat_cum_pct_per, color = 'black', linewidth = 1.5)
+
+    plt.grid(True, which = 'both', linewidth = 0.25, color = 'grey')
+    plt.rc('axes', axisbelow = True)
+    plt.axhline(y = 0, color = 'black', linewidth = 1)
+    plt.title('Forward and Backward Similar Price Periods to Latest Price Period')
+    plt.xlabel('Number of Trading Dates')
+    plt.ylabel('Percentage Change')
+    plt.legend(handles = [mlines.Line2D([], [], color = 'tomato', label = 'Backward Cumulative Percentage Periods'),
+                          mlines.Line2D([], [], color = 'dodgerblue', label = 'Forward Cumulative Percentage Periods'),
+                          mlines.Line2D([], [], color = 'black', label = 'Latest Cumulative Percentage Period')],
+               loc = 'upper left')
+
+    plt.show() 
+
+    ''' Plot the Distribution of Unique Percentage Changes for Backward Similar Price Periods '''
+    plt.figure(figsize = (30, 10))
+
+    plt.hist(bck_pct_cont_per, bins = 250, color = 'thistle', edgecolor = 'black')
+
+    plt.grid(True, which = 'both', linewidth = 0.25, color = 'grey')
+    plt.rc('axes', axisbelow = True)
+    plt.axhline(y = 0, color = 'black', linewidth = 1)
+    plt.axvline(x = 0, color = 'black', linewidth = 2, linestyle = '--')
+    plt.title('Distribution of Unique Percentage Changes for Backward Similar Price Periods')
+    plt.xlabel('Percentage Change')
+    plt.ylabel('Frequency')
+
+    plt.show()
+
+    ''' Plot the Distribution of Unique Percentage Changes for Forward Similar Price Periods '''
+    plt.figure(figsize = (30, 10))
+
+    plt.hist(fwd_pct_cont_per, bins = 250, color = 'dodgerblue', edgecolor = 'black')
+
+    plt.grid(True, which = 'both', linewidth = 0.25, color = 'grey')
+    plt.rc('axes', axisbelow = True)
+    plt.axhline(y = 0, color = 'black', linewidth = 1)
+    plt.axvline(x = 0, color = 'black', linewidth = 2, linestyle = '--')
+    plt.title('Distribution of Unique Percentage Changes for Forward Similar Price Periods')
+    plt.xlabel('Percentage Change')
+    plt.ylabel('Frequency')
+
+    plt.show()
+
+    ''' Plot Unique Continuous Price Periods to Latest Price Period '''
+    plt.figure(figsize = (30, 10))
+
+    for per in cont_price_pers_func(bck_pct_cont_per):
+        plt.plot(per, color = 'tomato', linewidth = 0.75, linestyle = '-')
+
+    for per in cont_price_pers_func(fwd_pct_cont_per):
+        plt.plot(per, color = 'dodgerblue', linewidth = 0.75, linestyle = '--')
+
+    plt.plot(lat_cum_pct_per, color = 'black', linewidth = 1.5)
+
+    plt.grid(True, which = 'both', linewidth = 0.25, color = 'grey')
+    plt.rc('axes', axisbelow = True)
+    plt.axhline(y = 0, color = 'black', linewidth = 1)
+    plt.title('Unique Continuous Price Periodss to Latest Price Period')
+    plt.xlabel('Number of Trading Dates')
+    plt.ylabel('Percentage Change')
+    plt.legend(handles = [mlines.Line2D([], [], color = 'tomato', label = 'Backward Cumulative Percentage, Continuous Unique Periods'),
+                          mlines.Line2D([], [], color = 'dodgerblue', label = 'Forward Cumulative Percentage , Continuous Unique Periods'),
+                          mlines.Line2D([], [], color = 'black', label = 'Latest Cumulative Percentage Period')],
+               loc = 'upper left')
+
+    plt.show() 
+
+''' Parameters for Monte Carlo Simulation '''
+fwd_log_chg = np.log((fwd_pct_cont_per / 100) + 1)
+fwd_log_mean = fwd_log_chg.mean()
+fwd_log_std = fwd_log_chg.std()
+fwd_log_var = fwd_log_chg.var()
+fwd_log_drift = (fwd_log_mean - (0.5 * fwd_log_var))
+
+''' Strikes '''
+strikes = options_data[options_data['exchange'] == exchange]['strikes'].iloc[0]
+
+''' Options Contracts '''
+options = []
+
+for strike in strikes:
+
+    call = Option(symbol = ticker,
+                  lastTradeDateOrContractMonth = num_trad_dates_def['exp_dates'],
+                  strike = strike,
+                  right = 'C',
+                  exchange = exchange)
+
+    put = Option(symbol = ticker,
+                 lastTradeDateOrContractMonth = num_trad_dates_def['exp_dates'],
+                 strike = strike,
+                 right = 'P',
+                 exchange = exchange)
+
+    options.append((call, put))
+    
+options = qualify_options_contracts_func(options)
+
+ib.disconnect()
+ib.sleep(5)
+
+while True:
+
+  clear_output(wait = True)
+
+  api_connect_func(client_id)
+  
+  ''' Market Timer Delay - Start '''
+  mkt_time_delay_start = t.time()
+  
+  ''' Live Cash Balance '''
+  while True:
+      acc_dets = ib.accountValues(account = '')
+      ib.sleep(0.01)
+  
+      for acc_det in acc_dets:
+          if acc_det.tag == 'TotalCashBalance' and acc_det.currency == 'USD':
+              cash_bal = float(acc_det.value)
+  
+      if not np.isnan(cash_bal):
+          break
+          
+  ''' Live Portfolio Value '''
+  with open(port_val_file, mode = 'r', newline = '') as file:
+          reader = csv.reader(file)
+          port_val = float(next(reader)[0])
+  
+  ''' Live Price of Underlying Ticker '''
+  while True:
+      live_price = ib.reqMktData(contract = stock_contract).last
+      ib.sleep(0.01)
+  
+      if not np.isnan(live_price):
+          break
+          
+  ''' Options within Boundaries '''
+  upp_strike_bnd = live_price * (1 + (strike_pct_bnd / 100))
+  low_strike_bnd = live_price * (1 - (strike_pct_bnd / 100))
+  
+  options_bnd = []
+  
+  for call, put in options:
+      if call.strike <= upp_strike_bnd and put.strike >= low_strike_bnd:
+          options_bnd.append((call, put))
+          
+  options = options_bnd
+  
+  ''' Out-of-The-Money Strikes '''
+  call_strikes = []
+  put_strikes = []
+  
+  for call, put in options:
+      
+      if call.strike > live_price:
+          call_strikes.append(call.strike)
+          
+      elif put.strike < live_price:
+          put_strikes.append(put.strike)
+          
+  put_strikes = sorted(put_strikes, reverse = True)
+  
+  ''' Out-of-The-Money Spread Combinations '''
+  call_spreads = list(iter.combinations(call_strikes, r = 2))
+  put_spreads = list(iter.combinations(put_strikes, r = 2))
+  
+  ''' Iron Condor Combinations '''
+  combos = [(call_spread[0], call_spread[1], put_spread[0], put_spread[1]) 
+            for call_spread in call_spreads for put_spread in put_spreads]
+  
+  ''' Live Number of Trading Days till Expiration and Exit'''
+  live_num_trad_days_exp = live_num_trad_days_exp_func(num_trad_dates_def['exp_dates'])
+  live_num_trad_days_ext = live_num_trad_days_exp - num_trad_exit_dates
+  live_trad_day_frac = live_trad_day_frac_func()
+  
+  ''' Monte Carlo Simulation '''
+  rand_price_gen = np.random.rand(num_trad_dates_ext_def + 1, trials)
+  z_scores = sci.stats.norm.ppf(rand_price_gen, loc = 0, scale = 1)
+  
+  pred_log_mult_pers = np.exp(fwd_log_drift + (fwd_log_std * z_scores))
+  
+  if list(half_hol_date_ind_func(num_trad_dates_def['exp_dates'])):
+      
+      for i in half_hol_date_ind_func(num_trad_dates_def['exp_dates']):
+          # (14/27) is the fraction of a normal trading day given to half holidays
+          pred_log_mult_pers[i + 1,:] = ((pred_log_mult_pers[i + 1,:] - 1) * 14/27) + 1
+  
+  pred_log_mult_pers[1,:] = ((pred_log_mult_pers[1,:] - 1) * (1 - live_trad_day_frac_func())) + 1
+  
+  pred_price_pers = np.zeros_like(pred_log_mult_pers)
+  pred_price_pers[0] = live_price
+  
+  for i in range(1, num_trad_dates_ext_def + 1):
+          pred_price_pers[i] = pred_price_pers[i - 1] *  pred_log_mult_pers[i]
+  
+  pred_price_pers = pd.DataFrame(pred_price_pers)
+  
+  ''' Live Options Bids / Asks  '''
+  while True:
+      strikes = []
+      call_bids = []
+      call_asks = []
+      put_bids = []
+      put_asks = []
+  
+      for call, put in options:
+  
+          strikes.append(call.strike)
+  
+          call_data = ib.reqMktData(contract = call)
+          ib.sleep(0.01)
+          call_bids.append(call_data.bid)
+          call_asks.append(call_data.ask)
+  
+          put_data = ib.reqMktData(contract = put)
+          ib.sleep(0.01)
+          put_bids.append(put_data.bid)
+          put_asks.append(put_data.ask)
+  
+      options_mkt = pd.DataFrame({'strikes': strikes,
+                                  'call_asks': call_asks,
+                                  'call_bids': call_bids,
+                                  'put_asks': put_asks,
+                                  'put_bids': put_bids})
+  
+      options_mkt = options_mkt.sort_values(by = 'strikes', ascending = False)
+      options_mkt = options_mkt.set_index('strikes')
+  
+      if not np.isnan(options_mkt).any().any():
+          break
+          
+  ''' Calculations for Trades '''
+  lc_strikes, sc_strikes, lp_strikes, sp_strikes = zip(*combos)
+  
+  lc_strikes = pd.Series(lc_strikes)
+  sc_strikes = pd.Series(sc_strikes)
+  lp_strikes = pd.Series(lp_strikes)
+  sp_strikes = pd.Series(sp_strikes)
+  
+  lc_asks = lc_strikes.map(options_mkt['call_asks'])
+  sc_bids = sc_strikes.map(options_mkt['call_bids'])
+  lp_asks = lp_strikes.map(options_mkt['put_asks'])
+  sp_bids = sp_strikes.map(options_mkt['put_bids'])
+  
+  prems_per_contract = (sc_bids - lc_asks) + (sp_bids - lp_asks)
+  contract_mult = pd.Series(float(options[0][0].multiplier), index = lc_strikes.index)
+  prems = prems_per_contract * contract_mult
+  
+  brk_eve_upps = lc_strikes + abs(prems_per_contract)
+  brk_eve_lows = lp_strikes - abs(prems_per_contract)
+  
+  trade_sizes = np.floor((port_val * (trade_size_pct / 100)) / abs(prems))
+  
+  ''' Filters for Iron Condor Combinations '''
+  combos_filter = ((abs(prems_per_contract) >= min_prem_per_contract) &
+                   (abs(prems_per_contract) <= max_prem_per_contract) &
+                   (((((sc_strikes - lc_strikes) / abs(prems_per_contract)) - 1) * 100) >= min_π_prem_pct) & 
+                   (((((sc_strikes - lc_strikes) / abs(prems_per_contract)) - 1) * 100) <= max_π_prem_pct) & 
+                   (((((lp_strikes - sp_strikes) / abs(prems_per_contract)) - 1) * 100) >= min_π_prem_pct) &
+                   (((((lp_strikes - sp_strikes) / abs(prems_per_contract)) - 1) * 100) <= max_π_prem_pct))
+  
+  lc_strikes = np.array(lc_strikes[combos_filter])
+  sc_strikes = np.array(sc_strikes[combos_filter])
+  lp_strikes = np.array(lp_strikes[combos_filter])
+  sp_strikes = np.array(sp_strikes[combos_filter])
+  
+  prems_per_contract = np.array(prems_per_contract[combos_filter])
+  contract_mult = np.array(contract_mult[combos_filter])
+  prems = prems_per_contract * contract_mult
+  
+  brk_eve_upps = np.array(brk_eve_upps[combos_filter])
+  brk_eve_lows = np.array(brk_eve_lows[combos_filter])
+  
+  trade_sizes = np.array(trade_sizes[combos_filter])
+  
+  ''' Broadcasting Series '''
+  lc_strikes_brdcst = lc_strikes[:, np.newaxis]
+  sc_strikes_brdcst = sc_strikes[:, np.newaxis]
+  lp_strikes_brdcst = lp_strikes[:, np.newaxis]
+  sp_strikes_brdcst = sp_strikes[:, np.newaxis]
+  
+  brk_eve_upps_brdcst = brk_eve_upps[:, np.newaxis]
+  brk_eve_lows_brdcst = brk_eve_lows[:, np.newaxis]
+  
+  ''' Filter Predicted Prices for Strikes within Iron Condor Combinations and Compute Means '''
+  pred_price_upp_bools = np.logical_and(np.array(pred_price_pers.iloc[-1]) >= lc_strikes_brdcst,
+                                         np.array(pred_price_pers.iloc[-1]) <= sc_strikes_brdcst)
+  pred_price_low_bools = np.logical_and(np.array(pred_price_pers.iloc[-1]) >= sp_strikes_brdcst,
+                                         np.array(pred_price_pers.iloc[-1]) <= lp_strikes_brdcst)
+  
+  pred_price_upps = np.where(pred_price_upp_bools, np.array(pred_price_pers.iloc[-1]), 0)
+  pred_price_lows = np.where(pred_price_low_bools, np.array(pred_price_pers.iloc[-1]), 0)
+  
+  pred_price_upp_means = []
+  
+  for pred_price_upp in pred_price_upps: 
+      pred_price_upp = pred_price_upp[pred_price_upp > 0]
+      
+      if len(pred_price_upp) == 0:
+          pred_price_upp_means.append(0)
+      else:
+          pred_price_upp_means.append(np.mean(pred_price_upp))
+                                      
+  pred_price_low_means = []
+  
+  for pred_price_low in pred_price_lows: 
+      pred_price_low = pred_price_low[pred_price_low > 0]
+      
+      if len(pred_price_low) == 0:
+          pred_price_low_means.append(0)
+      else:
+          pred_price_low_means.append(np.mean(pred_price_low))
+          
+  ''' Scenario Probabilities for Iron Condor Combinations '''
+  prob_a_pct = (np.sum(np.array(pred_price_pers.iloc[-1]) <= sp_strikes_brdcst, axis = 1) / trials) * 100
+  prob_b_pct = (np.sum(pred_price_low_bools, axis = 1) / trials) * 100
+  prob_c_pct = (np.sum(np.logical_and(np.array(pred_price_pers.iloc[-1]) >= lp_strikes_brdcst, 
+                                      np.array(pred_price_pers.iloc[-1]) <= lc_strikes_brdcst), axis = 1) / trials) * 100
+  prob_d_pct = (np.sum(pred_price_upp_bools, axis = 1) / trials) * 100
+  prob_e_pct = (np.sum(np.array(pred_price_pers.iloc[-1]) >= sc_strikes_brdcst, axis = 1) / trials) * 100
+  
+  prob_brk_eve_upps_pct = (np.sum(np.array(pred_price_pers.iloc[-1]) >= brk_eve_upps_brdcst, axis = 1) / trials) * 100
+  prob_brk_eve_lows_pct = (np.sum(np.array(pred_price_pers.iloc[-1]) <= brk_eve_lows_brdcst, axis = 1) / trials) * 100
+  
+  prob_π_pct = (np.sum(np.logical_or(np.array(pred_price_pers.iloc[-1]) >= brk_eve_upps_brdcst, 
+                                     np.array(pred_price_pers.iloc[-1]) <= brk_eve_lows_brdcst), axis = 1) / trials) * 100
+  
+  
+  ''' Scenario Expected Profits (in absolute terms) '''
+  exp_π_a = (prob_a_pct / 100) * (lp_strikes - sp_strikes - abs(prems_per_contract)) * contract_mult
+  exp_π_b = (prob_b_pct / 100) * (brk_eve_lows - pred_price_low_means) * contract_mult
+  exp_π_c = (prob_c_pct / 100) * prems
+  exp_π_d = (prob_d_pct / 100) * (pred_price_upp_means - brk_eve_upps) * contract_mult
+  exp_π_e = (prob_e_pct / 100) * (sc_strikes - lc_strikes - abs(prems_per_contract)) * contract_mult
+  
+  exp_π = exp_π_a + exp_π_b + exp_π_c + exp_π_d + exp_π_e 
+  
+  ''' Market Timer Delay - End ''' 
+  mkt_time_delay_end = t.time()
+  mkt_time_delay_dur = mkt_time_delay_end - mkt_time_delay_start
+  
+  ''' Trade Entries Dataframe '''
+  trade_entries = pd.DataFrame({'lc_strikes': lc_strikes,
+                                'sc_strikes': sc_strikes,
+                                'lp_strikes': lp_strikes,
+                                'sp_strikes': sp_strikes,
+                                'prems_per_contract': prems_per_contract,
+                                'contract_mult': contract_mult,
+                                'prems': prems,
+                                'trade_sizes': trade_sizes,
+                                'total_prems': prems * trade_sizes,
+                                'brk_eve_upps': brk_eve_upps,
+                                'brk_eve_upps_pct': ((brk_eve_upps / live_price) - 1) * 100,
+                                'prob_brk_eve_upps_pct': prob_brk_eve_upps_pct,
+                                'brk_eve_lows': brk_eve_lows,
+                                'brk_eve_lows_pct': ((brk_eve_lows / live_price) - 1) * 100,
+                                'prob_brk_eve_lows_pct': prob_brk_eve_lows_pct,
+                                'π_prem_sc_pct': (((sc_strikes - lc_strikes) / abs(prems_per_contract)) - 1) * 100,
+                                'prob_sc_pct': prob_e_pct,
+                                'π_prem_sp_pct': (((lp_strikes - sp_strikes) / abs(prems_per_contract)) - 1) * 100,
+                                'prob_sp_pct': prob_a_pct,
+                                'prob_π_pct': prob_π_pct,
+                                'exp_π': exp_π,
+                                'total_exp_π': exp_π * trade_sizes,
+                                'exp_π_prems_pct': (exp_π / abs(prems)) * 100})
+  
+  trade_entries = trade_entries.sort_values(by = 'exp_π_prems_pct', ascending = False)
+  
+  ''' Filter Trade Entries for Minimum Probability of Profit '''
+  with open(min_prob_π_pct_file, mode = 'r', newline = '') as file:
+                  reader = csv.reader(file)
+                  min_prob_π_pct = float(next(reader)[0])
+  
+  trade_entries = trade_entries[(trade_entries['prob_π_pct'] >= min_prob_π_pct) &
+                                (trade_entries['exp_π_prems_pct'] >= min_exp_π_prems_pct)]
+  
+  ''' Trade Entries Display '''
+  trade_entries_dis = pd.DataFrame({'lc': trade_entries['lc_strikes'],
+                                    'sc': trade_entries['sc_strikes'],
+                                    'lp': trade_entries['lp_strikes'],
+                                    'sp': trade_entries['sp_strikes'], 
+                                    'prem': [f"{val:,.2f}" for val in trade_entries['prems']],
+                                    'size': trade_entries['trade_sizes'],
+                                    'tot_prem': [f"{val:,.2f}" for val in trade_entries['total_prems']],
+                                    'upps': trade_entries['brk_eve_upps'],
+                                    'upps_pct': [f"{pct:,.2f}%" for pct in trade_entries['brk_eve_upps_pct']],
+                                    'prob_upps': [f"{pct:,.2f}%" for pct in trade_entries['prob_brk_eve_upps_pct']],
+                                    'lows': trade_entries['brk_eve_lows'],
+                                    'lows_pct': [f"{pct:,.2f}%" for pct in trade_entries['brk_eve_lows_pct']],
+                                    'prob_lows': [f"{pct:,.2f}%" for pct in trade_entries['prob_brk_eve_lows_pct']],
+                                    'sc_prem_pct': [f"{pct:,.2f}%" for pct in trade_entries['π_prem_sc_pct']],
+                                    'prob_sc_pct': [f"{pct:,.2f}%" for pct in trade_entries['prob_sc_pct']],
+                                    'sp_prem_pct': [f"{pct:,.2f}%" for pct in trade_entries['π_prem_sp_pct']],
+                                    'prob_sp_pct': [f"{pct:,.2f}%" for pct in trade_entries['prob_sp_pct']],
+                                    'prob_π_pct': [f"{pct:,.2f}%" for pct in trade_entries['prob_π_pct']],
+                                    'exp_π': [f"{val:,.2f}" for val in trade_entries['exp_π']],
+                                    'tot_exp_π': [f"{val:,.2f}" for val in trade_entries['total_exp_π']],
+                                    'exp_π_pct': [f"{pct:,.2f}%" for pct in trade_entries['exp_π_prems_pct']]})
+  
+  ''' Market and Algo Statistics '''
+  print('-------------------------------------------------------------------------------------------------- MARKET AND ALGO STATISTICS ---------------------------------------------------------------------------------------------------') 
+  print('')
+  print('Market Price Delay: ' + str(round(mkt_time_delay_dur, 2)) + ' secs')
+  print('Underlying Price: ' + str(live_price))
+  print('')
+  print('Expiration Date: ' + dt.datetime.strptime(num_trad_dates_def['exp_dates'], "%Y%m%d").strftime("%Y-%m-%d"))
+  print('Trading Days till Expiration: ' + str(round(live_num_trad_days_exp, 2)))
+  print('Trading Days till Exit: ' + str(round(live_num_trad_days_ext, 2)))
+  print('Percentage of Trading Day Remaining: ' + str(round((1 - live_trad_day_frac) * 100, 2)) + '%')
+  print('Time (USA): ' + str(dt.datetime.now(pytz.utc).replace(tzinfo = pytz.utc).astimezone(pytz.timezone('US/Eastern')).strftime("%H:%M:%S")))
+  print('')
+  print('Expected Price at Exit: ' + str(round(pred_price_pers.iloc[-1].mean(), 2)))
+  print('Expected Percentage Change at Exit: ' + str(round(((pred_price_pers.iloc[-1].mean() / live_price) - 1) * 100, 2)) + '%')
+  print('')
+  print('Combinations - Filter 0: ' + f"{len(combos):,.0f}")
+  print('Combinations - Filter 1: ' + f"{len(lc_strikes):,.0f}")
+  print('Combinations - Filter 2: ' + f"{len(trade_entries):,.0f}")
+  print('')
+  print('Minimum Probabiltiy of Profit Percentage: ' + str(min_prob_π_pct) + '%')
+  print('Minimum Expected Profit Percentage: ' + str(min_exp_π_prems_pct) + '%')
+  print('')
+  
+  if len(trade_entries):
+      
+      print('------------------------------------------------------------------------------------------------------ TRADE ENTRIES TABLE ------------------------------------------------------------------------------------------------------') 
+      print('')
+      print('------ STRIKES -------  --------- COSTS ----------  --------------------------- BREAKEVENS -------------------------  -------------------- MAX_π_SCENARIOS ---------------------  ------------------ SIM_EXPS -------------------')
+      print(tb.tabulate(trade_entries_dis.head(20), headers = trade_entries_dis.columns, colalign = ('right',) * len(trade_entries_dis.columns), showindex = False))
+      print('')
+  
+  ''' Condition A - Available Trade Entries '''
+  with open(min_prob_π_pct_file, mode = 'r', newline = '') as file:
+      reader = csv.reader(file)
+      min_prob_π_pct = float(next(reader)[0])
+              
+  if len(trade_entries):
+      cond_a_bool = True   
+  else:
+      cond_a_bool = False
+      
+  if cond_a_bool:
+      
+      if min_prob_π_pct < min_prob_π_pct_def:
+          min_prob_π_pct += 1
+          cond_a_stat = 'Trades Available, Minimum Prob. of Profit Threshold has been increased for the next loop...'
+      else:
+          cond_a_stat = 'Trades Available, Minimum Prob. of Profit Threshold is at Max Percentage...'
+          
+  else:
+      min_prob_π_pct -= 1
+      cond_a_stat = 'No Trades Available, Minimum Prob. of Profit Threshold has been lowered for the next loop...' 
+      
+  with open(min_prob_π_pct_file, mode = 'w', newline = '') as file:
+      writer = csv.writer(file)
+      writer.writerow([min_prob_π_pct])
+  
+  ''' Condition B - Trade Entry Percentage Change Hurdle '''
+  if cond_a_bool:
+      
+      file_size = os.path.getsize(lat_price_file)
+  
+      if file_size:
+  
+          with open(lat_price_file, mode = 'r', newline = '') as file:
+                  reader = csv.reader(file)
+                  lat_price = float(next(reader)[0])
+  
+          lat_price_pct = ((live_price / lat_price) - 1) * 100
+          
+          print('Last Trade to Live Price: ' + str(round(lat_price_pct, 2)) + '%')
+          print('')
+  
+          if lat_price_pct >= trade_entry_pct_hurd or abs(lat_price_pct) >= trade_entry_pct_hurd:
+  
+              cond_b_bool = True
+              cond_b_stat = 'Price has met Percentage Hurdle...'
+          else:
+              cond_b_bool = False
+              cond_b_stat = 'Price has not met Percentage Hurdle...'
+      else:
+          cond_b_bool = True
+          cond_b_stat = 'No Previous Trades have been Made...'
+          
+  else:
+      cond_b_bool = False
+      cond_b_stat = cond_a_stat
+  
+  print('------------------------------------------------------------------------------------------------------ TRADE ENTRY UPDATES ------------------------------------------------------------------------------------------------------')
+  print('')
+  
+  if cond_a_bool and cond_b_bool:
+      
+      print(cond_a_stat)
+      print('')
+      print(cond_b_stat)
+      print('')
+  else:    
+      print(cond_b_stat)
+      print('')
+  
+  ''' Trade Entry Order '''
+  if cond_b_bool:
+      
+      lc_option = [option[0] for option in options if option[0].strike == trade_entries['lc_strikes'].iloc[0]][0]
+      sc_option = [option[0] for option in options if option[0].strike == trade_entries['sc_strikes'].iloc[0]][0]
+      lp_option = [option[1] for option in options if option[1].strike == trade_entries['lp_strikes'].iloc[0]][0]
+      sp_option = [option[1] for option in options if option[1].strike == trade_entries['sp_strikes'].iloc[0]][0]
+      
+      combo_legs = [ComboLeg(conId = lc_option.conId, ratio = 1, action = 'BUY', exchange = exchange),
+                    ComboLeg(conId = sc_option.conId, ratio = 1, action = 'SELL', exchange = exchange),
+                    ComboLeg(conId = lp_option.conId, ratio = 1, action = 'BUY', exchange = exchange),
+                    ComboLeg(conId = sp_option.conId, ratio = 1, action = 'SELL', exchange = exchange)]
+      
+      combo_option = Contract(symbol = ticker,
+                              secType = 'BAG',
+                              exchange = exchange,
+                              currency = currency,
+                              comboLegs = combo_legs)
+      
+      order_type = LimitOrder(action = 'BUY',
+                              totalQuantity = trade_entries['trade_sizes'].iloc[0],
+                              lmtPrice = abs(trade_entries['prems_per_contract'].iloc[0]))
+      
+      order_entry = ib.placeOrder(contract = combo_option,
+                                  order = order_type)
+      
+      print('New Order has been Submitted...')
+      print('')
+      
+      ib.sleep(60)
+      
+      ''' Trade Management '''
+      open_orders = ib.reqAllOpenOrders()
+      ib.sleep(1)
+      
+      open_order_bool = False
+  
+      for open_order in open_orders:
+  
+          if open_order.order.clientId == client_id:
+              open_order_bool = True
+              break
+      
+      if open_order_bool:
+          
+          ib.cancelOrder(order = order_entry.order)
+          ib.sleep(1)
+      
+          ib.disconnect()
+          ib.sleep(5)
+          api_connect_func(client_id)
+          
+          fills = ib.fills()
+          ib.sleep(5)
+          fills = [fill for fill in fills if recent_fill_check_func(fill)]
+          
+          if fills:
+              
+              order_exe_bool = True
+              order_exe_stat = 'Order Partially Filled...'
+          else:
+              order_exe_bool = False
+              order_exe_stat = 'Order Cancelled...'
+      else:
+          order_exe_bool = True
+          order_exe_stat = 'Order Completed...'
+          
+      print(order_exe_stat)
+      print('')
+          
+      ''' Trade Execution Details '''
+      if order_exe_bool:
+          
+          fills = ib.fills()
+          ib.sleep(5)
+          fills = [fill for fill in fills if recent_fill_check_func(fill)]
+  
+          option_fills = [fill for fill in fills if fill.contract.secType == 'OPT'and fill.execution.clientId == client_id]
+          combo_fills = [fill for fill in fills if fill.contract.secType == 'BAG' and fill.execution.side == 'BOT']
+  
+          avg_lmt_price  = sum(np.array([fill.execution.price for fill in combo_fills]) * np.array([fill.execution.shares for fill in combo_fills])) / sum([fill.execution.shares for fill in combo_fills])
+          trade_size = sum([fill.execution.shares for fill in combo_fills])
+          commission = sum(fill.commissionReport.commission for fill in option_fills)
+          avg_price = avg_lmt_price + (commission / (trade_size * trade_entries['contract_mult'].iloc[0]))
+          live_num_trad_days_exp = live_num_trad_days_exp_func(num_trad_dates_def['exp_dates'])
+          live_num_trad_days_ext = live_num_trad_days_exp - num_trad_exit_dates
+          exe_time_usa = dt.datetime.now(pytz.utc).replace(tzinfo = pytz.utc).astimezone(pytz.timezone('US/Eastern'))
+          
+          ''' Trade Entry File Updates '''
+          while True:
+              live_price = ib.reqMktData(contract = stock_contract).last
+              ib.sleep(0.1)
+  
+              if not np.isnan(live_price):
+                  break
+                  
+          with open(lat_price_file, 'w', newline = '') as file:
+              writer = csv.writer(file)
+              writer.writerow([live_price])
+              
+          trade_entry_exe_dets = [str(lc_option),
+                                  str(sc_option),
+                                  str(lp_option),
+                                  str(sp_option),
+                                  str(combo_option),
+                                  avg_lmt_price,
+                                  trade_size,
+                                  commission,
+                                  avg_price,
+                                  live_num_trad_days_exp,
+                                  live_num_trad_days_ext,
+                                  exe_time_usa]
+          
+          with open(active_trades_file, 'a', newline = '') as file:
+              writer = csv.writer(file)
+              writer.writerow(trade_entry_exe_dets)
+              
+          print('New Trade Details have been added to Active Trades File...')
+       
+      else:  
+          print('Order was Cancelled - No Details have been updated to Files...') 
+      
+      ib.disconnect()
+      ib.sleep(60)
+  else:
+      print('No Orders were made in this loop...')
+      
+      ib.disconnect()
+      ib.sleep(60)
